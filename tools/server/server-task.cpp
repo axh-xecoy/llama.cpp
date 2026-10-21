@@ -1711,6 +1711,42 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+// entries with a short prompt are cheap to rebuild, but they still take a sizeable chunk of
+// host memory: the recurrent state of a hybrid model is stored in full inside every context
+// checkpoint, so even a 2k prompt costs a few hundred MiB. when the cache needs room, dropping
+// one of those is much cheaper than dropping a long prompt that took minutes to prefill
+static constexpr int64_t s_prompt_cache_n_tokens_small = 8192;
+static constexpr size_t  s_prompt_cache_n_small_keep   =  5;
+
+static void prompt_cache_evict_one(std::list<server_prompt_cache_state> & states) {
+    size_t n_small  = 0;
+    auto   it_small = states.end();
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->prompt.n_tokens() <= s_prompt_cache_n_tokens_small) {
+            n_small++;
+            if (it_small == states.end()) {
+                it_small = it; // the list is in insertion order: the first match is the least recently used one
+            }
+        }
+    }
+
+    if (n_small > s_prompt_cache_n_small_keep && it_small != states.end()) {
+        SRV_WRN(" - removing cached prompt with a short prompt (length %d, checkpoints: %d, size = %.3f MiB, %zu such entries)\n",
+                it_small->prompt.n_tokens(), (int) it_small->prompt.checkpoints.size(),
+                it_small->size() / (1024.0 * 1024.0), n_small);
+
+        states.erase(it_small);
+        return;
+    }
+
+    SRV_WRN(" - removing oldest cached prompt (length %d, checkpoints: %d, size = %.3f MiB)\n",
+            states.front().prompt.n_tokens(), (int) states.front().prompt.checkpoints.size(),
+            states.front().size() / (1024.0 * 1024.0));
+
+    states.pop_front();
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1753,10 +1789,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            prompt_cache_evict_one(states);
         }
     }
 
@@ -1927,9 +1960,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            prompt_cache_evict_one(states);
         }
     }
 
@@ -1941,10 +1972,7 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            prompt_cache_evict_one(states);
         }
     }
 
