@@ -2726,6 +2726,159 @@ private:
         return n_read;
     }
 
+
+public:
+
+    // ---- auto persistence of the live slot state across restarts ----
+    //
+    // the RAM prompt cache and the slot state both die with the process. when --slot-save-path
+    // is set, the slot is snapshotted on shutdown and reloaded on the next start, so a long
+    // session resumes with a prefix hit instead of a full re-prefill.
+    //
+    // the target state reuses the /slots save format (tokens + llama state + checkpoint appendix),
+    // so the two paths stay byte compatible. the draft state goes to a sidecar file because
+    // llama_state_seq_save_file always rewrites the file from offset 0.
+    // everything here is best effort: any mismatch is one warning and a cold start.
+
+    std::string persist_slot_file(const char * suffix) const {
+        return params_base.slot_save_path + "auto-slot0" + suffix;
+    }
+
+    bool persist_slot_save(const server_slot & slot) {
+        std::vector<char> packed;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & err) {
+            SRV_WRN("%s: cannot serialize the slot tokens: %s\n", __func__, err.what());
+            return false;
+        }
+
+        const std::string filepath = persist_slot_file(".bin");
+        const size_t nwrite = llama_state_seq_save_file(
+                ctx_tgt, filepath.c_str(), slot.id,
+                reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            SRV_WRN("%s: failed to save the slot state to '%s'\n", __func__, filepath.c_str());
+            return false;
+        }
+
+        size_t nwrite_ckpt = 0;
+        if (!save_slot_checkpoints(filepath, slot, nwrite_ckpt)) {
+            SRV_WRN("%s: incomplete checkpoint appendix in '%s'\n", __func__, filepath.c_str());
+            return false;
+        }
+
+        // the draft memory is not part of the target state file; without it the restored slot
+        // restarts with an empty draft and accepts far fewer speculative tokens (llama.cpp #30574)
+        size_t nwrite_dft = 0;
+        if (ctx_dft != nullptr) {
+            const std::string dpath = persist_slot_file(".drft");
+            nwrite_dft = llama_state_seq_save_file(
+                    ctx_dft, dpath.c_str(), slot.id,
+                    reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+            if (nwrite_dft == 0) {
+                SRV_WRN("%s: failed to save the draft state to '%s' - a restored slot would accept fewer draft tokens\n",
+                        __func__, dpath.c_str());
+            }
+        }
+
+        SRV_INF("%s: saved the slot state (%zu tokens, %.1f MiB target, %.1f MiB draft, %.1f MiB checkpoints)\n",
+                __func__, slot.prompt.tokens.size(),
+                1e-6 * (double) nwrite, 1e-6 * (double) nwrite_dft, 1e-6 * (double) nwrite_ckpt);
+
+        return true;
+    }
+
+    bool persist_slot_load(server_slot & slot) {
+        const std::string filepath = persist_slot_file(".bin");
+        if (!std::filesystem::exists(std::filesystem::u8path(filepath))) {
+            SRV_INF("%s: no saved slot state at '%s', starting cold\n", __func__, filepath.c_str());
+            return false;
+        }
+
+        size_t nread = 0;
+        llama_tokens tokens;
+        try {
+            size_t n_packed = 0;
+            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread != 0) {
+                tokens.resize(std::max<size_t>(1, n_packed));
+                nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &n_packed);
+            }
+            if (nread == 0) {
+                SRV_WRN("%s: '%s' does not fit this context (model, n_ctx or KV type changed?)\n",
+                        __func__, filepath.c_str());
+                return false;
+            }
+            tokens.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(tokens, mctx != nullptr);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                SRV_WRN("%s: '%s' holds %zu tokens, more than the slot context holds\n",
+                        __func__, filepath.c_str(), restored.size());
+                return false;
+            }
+            if (!restored.validate(ctx_tgt)) {
+                SRV_WRN("%s: '%s' holds invalid tokens\n", __func__, filepath.c_str());
+                return false;
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & err) {
+            slot.prompt_clear();
+            SRV_WRN("%s: cannot restore '%s': %s\n", __func__, filepath.c_str(), err.what());
+            return false;
+        }
+
+        // optional sidecar: a missing or mismatched draft state only means an empty draft
+        if (ctx_dft != nullptr) {
+            const std::string dpath = persist_slot_file(".drft");
+            if (std::filesystem::exists(std::filesystem::u8path(dpath))) {
+                size_t n_dft = 0;
+                llama_state_seq_load_file(ctx_dft, dpath.c_str(), slot.id, nullptr, 0, &n_dft);
+                if (n_dft != 0) {
+                    std::vector<llama_token> dtok(std::max<size_t>(1, n_dft));
+                    if (llama_state_seq_load_file(ctx_dft, dpath.c_str(), slot.id, dtok.data(), dtok.size(), &n_dft) == 0) {
+                        SRV_WRN("%s: the draft state in '%s' does not fit the draft context - dropped\n",
+                                __func__, dpath.c_str());
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                    }
+                }
+            }
+        }
+
+        load_slot_checkpoints(filepath, nread, slot);
+
+        SRV_INF("%s: restored %zu tokens and %zu checkpoint(s) from '%s'\n",
+                __func__, slot.prompt.tokens.size(), slot.prompt.checkpoints.size(), filepath.c_str());
+
+        return true;
+    }
+
+    void persist_on_shutdown() {
+        if (params_base.slot_save_path.empty()) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (slot.prompt.tokens.size() == 0) {
+                continue;
+            }
+            SRV_INF("%s: persisting slot %d\n", __func__, slot.id);
+            persist_slot_save(slot);
+        }
+    }
+
+    void restore_on_startup() {
+        if (params_base.slot_save_path.empty()) {
+            return;
+        }
+        for (auto & slot : slots) {
+            persist_slot_load(slot);
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -4689,6 +4842,19 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+}
+
+
+void server_context::persist_on_shutdown() {
+    if (impl) {
+        impl->persist_on_shutdown();
+    }
+}
+
+void server_context::restore_on_startup() {
+    if (impl) {
+        impl->restore_on_startup();
+    }
 }
 
 void server_context::terminate() {

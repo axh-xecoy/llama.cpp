@@ -497,6 +497,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
         SRV_INF("%s", "model loaded\n");
 
+        // reload a slot state saved by the previous run (only with --slot-save-path)
+        ctx_server.restore_on_startup();
+
         shutdown_handler = [&](int) {
             mcp_mgr.shutdown();
             // this will unblock start_loop()
@@ -545,6 +548,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
+
+        // the loop has stopped but the model is still alive: snapshot the slot state
+        ctx_server.persist_on_shutdown();
 
         clean_up();
         ctx_http.join();
