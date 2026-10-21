@@ -1803,7 +1803,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // the slot already holds its own prompt and reusing it is free, while restoring a cached
+    // state costs a full copy of that state (~0.2 s for a 75k prompt). an entry must therefore
+    // reuse meaningfully more tokens than the slot does in order to be worth a restore
+    int64_t lcp_states = -1;
+
+    // find the cached prompt that reuses the most tokens of this request
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1812,12 +1817,33 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        // selecting by f_keep favours short entries: a short entry that is fully matched scores
+        // 1.000, and no longer entry can ever beat that, even if it reuses far more tokens
+        const bool partial = (size_t) lcp_cur < it->prompt.tokens.size();
+
+        // when the lcp is not the whole entry, the slot rolls back to a context checkpoint at or
+        // below the lcp (a recurrent/hybrid memory cannot be truncated). use the same predicate
+        // that the caller uses, see the checkpoint search in server_context
+        bool has_ckpt = false;
+        for (const auto & cur : it->prompt.checkpoints) {
+            if (cur.pos_max <= lcp_cur && (cur.pos_min < lcp_cur || cur.pos_min == 0)) {
+                has_ckpt = true;
+                break;
+            }
+        }
+
+        // without such a checkpoint a partial restore reprocesses the whole prompt, which is
+        // worse than whatever the slot already holds. keep the old rule for that case only
+        if (partial && !has_ckpt && f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        // the restore cost grows with the entry size, so a small entry needs a smaller margin
+        const int64_t margin = std::min<int64_t>(128, (int64_t) it->prompt.tokens.size() / 4);
+
+        if (lcp_cur > lcp_best + margin && lcp_cur > lcp_states) {
+            lcp_states = lcp_cur;
+
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -1827,6 +1853,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        const size_t n_tokens_best = it_best->prompt.tokens.size();
+
+        // a partial restore means the slot rolls back to a checkpoint and then diverges from the
+        // cached prompt. the slot cannot rebuild the rest of the entry afterwards, so keep it
+        const bool partial = (size_t) lcp_states < n_tokens_best;
 
         {
             auto & data = it_best->data.main;
@@ -1839,8 +1871,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!partial) {
+                data.clear();
+                data.shrink_to_fit();
+            }
         }
 
         {
@@ -1857,18 +1891,38 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!partial) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (partial) {
+            // hand the slot its own copy so that the entry stays readable for the next request.
+            // only the checkpoints at or below the lcp are needed, the caller drops the rest
+            // anyway (anything with pos_max > pos_next)
+            prompt.tokens = it_best->prompt.tokens.clone();
 
-        states.erase(it_best);
+            prompt.checkpoints.clear();
+            for (const auto & ckpt : it_best->prompt.checkpoints) {
+                if (ckpt.pos_max <= lcp_states) {
+                    prompt.checkpoints.push_back(ckpt);
+                }
+            }
+
+            SRV_TRC(" - kept the cached prompt (partial reuse: %d of %zu tokens, %zu checkpoints kept)\n",
+                    (int) lcp_states, n_tokens_best, prompt.checkpoints.size());
+        } else {
+            prompt = std::move(it_best->prompt);
+
+            states.erase(it_best);
+        }
     }
 
     return true;
 }
+
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
